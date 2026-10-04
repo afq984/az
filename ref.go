@@ -1,11 +1,14 @@
 package az
 
-// Ref is a type-safe container for a parsed CLI value.
+// Ref holds the parsed value of a flag or positional argument.
 type Ref[T any] struct {
-	value      T
-	isSet      bool
-	hasDefault bool
+	value T
+	isSet bool
 }
 
-func (r *Ref[T]) Get() T      { return r.value }
+// Get returns the parsed value, or the default if the flag or argument was
+// not given.
+func (r *Ref[T]) Get() T { return r.value }
+
+// IsSet reports whether the value was given on the command line.
 func (r *Ref[T]) IsSet() bool { return r.isSet }

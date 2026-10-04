@@ -28,7 +28,8 @@ type ZeroArgConv[T any] interface {
 // MultiValueConv is implemented by converters whose flags consume several
 // value tokens (e.g. --point 1 2 3). NArgs reports how many: a fixed
 // count >= 2, or VariadicNArgs to consume until the next recognized flag
-// (or until a terminator token, if TerminatedConv is also implemented).
+// or "--" (or until a terminator token, if TerminatedConv is also
+// implemented).
 //
 // Arity is static metadata on the flag definition, not a runtime
 // "wantMore" protocol on the converter: Conv values stay stateless
@@ -73,17 +74,19 @@ type boolConv struct{}
 
 func (boolConv) FromString(s string) (bool, error) { return strconv.ParseBool(s) }
 func (boolConv) ToString(v bool) string            { return strconv.FormatBool(v) }
-func (boolConv) Complete(string) []string          { return []string{"true", "false"} }
+func (boolConv) Complete(p string) []string        { return withPrefix([]string{"true", "false"}, p) }
 func (boolConv) ImpliedValue() bool                { return true }
 
+// Built-in converters. Bool is a ZeroArgConv: a Bool flag takes no value
+// token (--verbose), but accepts an attached one (--verbose=false).
 var (
-	Bool     boolConv
-	String   = convFunc[string]{from: func(s string) (string, error) { return s, nil }, to: func(v string) string { return v }}
-	Int      = convFunc[int]{from: func(s string) (int, error) { v, e := strconv.ParseInt(s, 10, 64); return int(v), e }, to: strconv.Itoa}
-	Int64    = convFunc[int64]{from: func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }, to: func(v int64) string { return strconv.FormatInt(v, 10) }}
-	Float64  = convFunc[float64]{from: func(s string) (float64, error) { return strconv.ParseFloat(s, 64) }, to: func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }}
-	Duration = convFunc[time.Duration]{from: time.ParseDuration, to: func(v time.Duration) string { return v.String() }}
-	IP       = convFunc[net.IP]{
+	Bool     ZeroArgConv[bool]   = boolConv{}
+	String   Conv[string]        = convFunc[string]{from: func(s string) (string, error) { return s, nil }, to: func(v string) string { return v }}
+	Int      Conv[int]           = convFunc[int]{from: strconv.Atoi, to: strconv.Itoa}
+	Int64    Conv[int64]         = convFunc[int64]{from: func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) }, to: func(v int64) string { return strconv.FormatInt(v, 10) }}
+	Float64  Conv[float64]       = convFunc[float64]{from: func(s string) (float64, error) { return strconv.ParseFloat(s, 64) }, to: func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }}
+	Duration Conv[time.Duration] = convFunc[time.Duration]{from: time.ParseDuration, to: func(v time.Duration) string { return v.String() }}
+	IP       Conv[net.IP]        = convFunc[net.IP]{
 		from: func(s string) (net.IP, error) {
 			ip := net.ParseIP(s)
 			if ip == nil {
@@ -99,28 +102,37 @@ var (
 // Composable converters
 // ---------------------------------------------------------------------------
 
-// Enum returns a Conv[string] that validates against allowed values.
-func Enum(allowed ...string) Conv[string] {
-	return convFunc[string]{
-		from: func(s string) (string, error) {
-			for _, a := range allowed {
-				if s == a {
-					return s, nil
-				}
-			}
-			return "", fmt.Errorf("must be one of %s, got %q", strings.Join(allowed, ", "), s)
-		},
-		to: func(v string) string { return v },
-		complete: func(partial string) []string {
-			var out []string
-			for _, a := range allowed {
-				if strings.HasPrefix(a, partial) {
-					out = append(out, a)
-				}
-			}
-			return out
-		},
+// Enum returns a Conv that accepts only the given values. T is usually
+// inferred: Enum("json", "text") is a Conv[string], and Enum(Red, Green)
+// with typed constants is a Conv[Color].
+func Enum[T ~string](allowed ...T) Conv[T] {
+	names := make([]string, len(allowed))
+	for i, a := range allowed {
+		names[i] = string(a)
 	}
+	return convFunc[T]{
+		from: func(s string) (T, error) {
+			for _, a := range allowed {
+				if s == string(a) {
+					return a, nil
+				}
+			}
+			return "", fmt.Errorf("must be one of %s, got %q", strings.Join(names, ", "), s)
+		},
+		to:       func(v T) string { return string(v) },
+		complete: func(partial string) []string { return withPrefix(names, partial) },
+	}
+}
+
+// withPrefix returns the candidates that start with partial.
+func withPrefix(candidates []string, partial string) []string {
+	var out []string
+	for _, c := range candidates {
+		if strings.HasPrefix(c, partial) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Separator builds a Conv[[]T] from a Conv[T], splitting on a delimiter.
@@ -176,23 +188,23 @@ func (c separatorConv[T]) Complete(partial string) []string {
 
 // FixedList builds a Conv[[]T] whose flag consumes exactly n value tokens:
 //
-//	point := Flag(app, "point", "Coordinates", FixedList(3, Float64))
+//	point := app.Flag("point", "Coordinates", FixedList(3, Float64))
 //	// --point 1 2 3, also --point=1,2,3
 func FixedList[T any](n int, element Conv[T]) Conv[[]T] {
 	if n < 2 {
-		panic("FixedList: n must be >= 2")
+		panic("az: FixedList: n must be >= 2")
 	}
 	return multiListConv[T]{n: n, element: element}
 }
 
 // Greedy builds a Conv[[]T] whose flag consumes value tokens until the
-// next recognized flag or the end of arguments:
+// next recognized flag, "--", or the end of arguments:
 //
-//	ports := Flag(app, "ports", "Ports", Greedy(Int))
+//	ports := app.Flag("ports", "Ports", Greedy(Int))
 //	// --ports 80 443 8080 --verbose
 //
-// Greedy flags are ambiguous next to positional arguments — a trailing
-// positional is consumed by the flag. Prefer FixedList, Separator, or
+// Greedy flags are ambiguous next to positional arguments and commands — a
+// trailing positional or command name is consumed by the flag. Prefer FixedList, Separator, or
 // FlagRepeat when the app has positionals.
 func Greedy[T any](element Conv[T]) Conv[[]T] {
 	return multiListConv[T]{n: VariadicNArgs, element: element}
@@ -201,11 +213,11 @@ func Greedy[T any](element Conv[T]) Conv[[]T] {
 // Until builds a Conv[[]T] whose flag consumes raw tokens — even
 // flag-shaped ones — until an exact terminator token, find -exec style:
 //
-//	OnFlag(app, "exec", "Command", Until(";", String), run)
+//	app.OnFlag("exec", "Command", Until(";", String), run)
 //	// -exec grep -l foo ;
 func Until[T any](stop string, element Conv[T]) Conv[[]T] {
 	if stop == "" {
-		panic("Until: stop token must be non-empty")
+		panic("az: Until: stop token must be non-empty")
 	}
 	return multiListConv[T]{n: VariadicNArgs, stop: stop, element: element}
 }
